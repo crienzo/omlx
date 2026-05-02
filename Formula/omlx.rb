@@ -63,29 +63,56 @@ class Omlx < Formula
     # `import xgrammar`, which crashes /admin/api/grammar/parsers and
     # hides the Reasoning Parser dropdown. Tracking upstream:
     # jundot/omlx#1005.
+    #
+    # Implemented via shell commands (rather than Ruby File I/O) so the
+    # behavior matches the manual reproduction script and so each step
+    # is visible in `brew install --verbose` output.
     if build.with?("grammar")
+      ohai "Patching xgrammar macOS arm64 wheel"
       py = libexec/"bin/python"
       site = Utils.safe_popen_read(py, "-c",
                                    "import site; print(site.getsitepackages()[0])").chomp
-      dylib = "#{site}/xgrammar/libxgrammar_bindings.dylib"
-      dist  = Dir["#{site}/xgrammar-*.dist-info"].first
       tvmlib = Utils.safe_popen_read(py, "-c",
         "import os, tvm_ffi; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'lib'))").chomp
+      dylib = "#{site}/xgrammar/libxgrammar_bindings.dylib"
+      dist_dirs = Dir["#{site}/xgrammar-*.dist-info"]
 
-      if File.exist?(dylib)
-        rpaths = Utils.safe_popen_read("/usr/bin/otool", "-l", dylib)
-        unless rpaths.include?(tvmlib)
-          system "/usr/bin/install_name_tool", "-add_rpath", tvmlib, dylib
-          system "/usr/bin/codesign", "--force", "--sign", "-", dylib
-        end
+      ohai "  site=#{site}"
+      ohai "  tvmlib=#{tvmlib}"
+      ohai "  dylib=#{dylib} (exists? #{File.exist?(dylib)})"
+      ohai "  dist-info=#{dist_dirs.inspect}"
+
+      odie "xgrammar dylib not found at #{dylib}" unless File.exist?(dylib)
+      odie "xgrammar dist-info not found under #{site}" if dist_dirs.empty?
+
+      # Patch 1: add tvm_ffi/lib to the dylib's rpath, then re-codesign so
+      # macOS will load the modified dylib.
+      rpaths = Utils.safe_popen_read("/usr/bin/otool", "-l", dylib)
+      if rpaths.include?(tvmlib)
+        ohai "  rpath already points at tvm_ffi/lib"
+      else
+        ohai "  adding rpath -> #{tvmlib}"
+        system "/usr/bin/install_name_tool", "-add_rpath", tvmlib, dylib
+        system "/usr/bin/codesign", "--force", "--sign", "-", dylib
       end
 
-      if dist
-        record = "#{dist}/RECORD"
-        unless File.exist?(record) && File.read(record).include?("libxgrammar_bindings.dylib")
-          File.open(record, "a") { |f| f.puts "xgrammar/libxgrammar_bindings.dylib,," }
-        end
+      # Patch 2: ensure RECORD lists the dylib so tvm_ffi's manifest-based
+      # lookup finds it. Use a shell append redirect for parity with the
+      # repro script and to sidestep any Ruby File.open quirks in the
+      # brew install context.
+      record = "#{dist_dirs.first}/RECORD"
+      if File.exist?(record) && File.read(record).include?("libxgrammar_bindings.dylib")
+        ohai "  RECORD already lists the dylib"
+      else
+        ohai "  appending dylib entry to #{record}"
+        system "/bin/sh", "-c",
+               "echo 'xgrammar/libxgrammar_bindings.dylib,,' >> #{record}"
       end
+
+      # Verify the patch took. Failing here is much less confusing than
+      # the user discovering it later via a 500 from the admin route.
+      ohai "  verifying import xgrammar..."
+      system py, "-c", "import xgrammar; print('xgrammar import OK')"
     end
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
