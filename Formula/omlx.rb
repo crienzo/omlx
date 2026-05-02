@@ -54,68 +54,72 @@ class Omlx < Formula
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
     system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
 
-    # Patch the macOS arm64 xgrammar wheel so its native binding loads.
-    # The 0.1.32+ wheel ships libxgrammar_bindings.dylib with
-    # @rpath/libtvm_ffi.dylib but no LC_RPATH pointing at where tvm_ffi
-    # installs its native lib, and the dist-info is missing a RECORD
-    # entry for the dylib so tvm_ffi's manifest-based lookup fails.
-    # Both manifest as RuntimeError("Cannot find library: ...") at
-    # `import xgrammar`, which crashes /admin/api/grammar/parsers and
-    # hides the Reasoning Parser dropdown. Tracking upstream:
-    # jundot/omlx#1005.
-    #
-    # Implemented via shell commands (rather than Ruby File I/O) so the
-    # behavior matches the manual reproduction script and so each step
-    # is visible in `brew install --verbose` output.
-    if build.with?("grammar")
-      ohai "Patching xgrammar macOS arm64 wheel"
-      py = libexec/"bin/python"
-      site = Utils.safe_popen_read(py, "-c",
-                                   "import site; print(site.getsitepackages()[0])").chomp
-      tvmlib = Utils.safe_popen_read(py, "-c",
-        "import os, tvm_ffi; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'lib'))").chomp
-      dylib = "#{site}/xgrammar/libxgrammar_bindings.dylib"
-      dist_dirs = Dir["#{site}/xgrammar-*.dist-info"]
+    bin.install_symlink Dir[libexec/"bin/omlx"]
+  end
 
-      ohai "  site=#{site}"
-      ohai "  tvmlib=#{tvmlib}"
-      ohai "  dylib=#{dylib} (exists? #{File.exist?(dylib)})"
-      ohai "  dist-info=#{dist_dirs.inspect}"
+  # Patch the macOS arm64 xgrammar wheel so its native binding loads.
+  # The 0.1.32+ wheel ships libxgrammar_bindings.dylib with
+  # @rpath/libtvm_ffi.dylib but no LC_RPATH pointing at where tvm_ffi
+  # installs its native lib, and the dist-info is missing a RECORD
+  # entry for the dylib so tvm_ffi's manifest-based lookup fails.
+  # Both manifest as RuntimeError("Cannot find library: ...") at
+  # `import xgrammar`, which crashes /admin/api/grammar/parsers and
+  # hides the Reasoning Parser dropdown. Tracking upstream:
+  # jundot/omlx#1005.
+  #
+  # Runs in post_install rather than install because Homebrew's
+  # post-install "Cleaning" step deletes every dist-info/RECORD file
+  # in the keg as part of its relocation pass (RECORD hashes become
+  # invalid once brew rewrites Mach-O install names). Anything we
+  # write to RECORD inside `def install` is wiped before the user
+  # sees it.
+  def post_install
+    return unless build.with?("grammar")
 
-      odie "xgrammar dylib not found at #{dylib}" unless File.exist?(dylib)
-      odie "xgrammar dist-info not found under #{site}" if dist_dirs.empty?
+    ohai "Patching xgrammar macOS arm64 wheel"
+    py = libexec/"bin/python"
+    site = Utils.safe_popen_read(py, "-c",
+                                 "import site; print(site.getsitepackages()[0])").chomp
+    tvmlib = Utils.safe_popen_read(py, "-c",
+      "import os, tvm_ffi; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'lib'))").chomp
+    dylib = "#{site}/xgrammar/libxgrammar_bindings.dylib"
+    dist_dirs = Dir["#{site}/xgrammar-*.dist-info"]
 
-      # Patch 1: add tvm_ffi/lib to the dylib's rpath, then re-codesign so
-      # macOS will load the modified dylib.
-      rpaths = Utils.safe_popen_read("/usr/bin/otool", "-l", dylib)
-      if rpaths.include?(tvmlib)
-        ohai "  rpath already points at tvm_ffi/lib"
-      else
-        ohai "  adding rpath -> #{tvmlib}"
-        system "/usr/bin/install_name_tool", "-add_rpath", tvmlib, dylib
-        system "/usr/bin/codesign", "--force", "--sign", "-", dylib
-      end
+    ohai "  site=#{site}"
+    ohai "  tvmlib=#{tvmlib}"
+    ohai "  dylib=#{dylib} (exists? #{File.exist?(dylib)})"
+    ohai "  dist-info=#{dist_dirs.inspect}"
 
-      # Patch 2: ensure RECORD lists the dylib so tvm_ffi's manifest-based
-      # lookup finds it. Use a shell append redirect for parity with the
-      # repro script and to sidestep any Ruby File.open quirks in the
-      # brew install context.
-      record = "#{dist_dirs.first}/RECORD"
-      if File.exist?(record) && File.read(record).include?("libxgrammar_bindings.dylib")
-        ohai "  RECORD already lists the dylib"
-      else
-        ohai "  appending dylib entry to #{record}"
-        system "/bin/sh", "-c",
-               "echo 'xgrammar/libxgrammar_bindings.dylib,,' >> #{record}"
-      end
+    odie "xgrammar dylib not found at #{dylib}" unless File.exist?(dylib)
+    odie "xgrammar dist-info not found under #{site}" if dist_dirs.empty?
 
-      # Verify the patch took. Failing here is much less confusing than
-      # the user discovering it later via a 500 from the admin route.
-      ohai "  verifying import xgrammar..."
-      system py, "-c", "import xgrammar; print('xgrammar import OK')"
+    # Patch 1: add tvm_ffi/lib to the dylib's rpath, then re-codesign so
+    # macOS will load the modified dylib.
+    rpaths = Utils.safe_popen_read("/usr/bin/otool", "-l", dylib)
+    if rpaths.include?(tvmlib)
+      ohai "  rpath already points at tvm_ffi/lib"
+    else
+      ohai "  adding rpath -> #{tvmlib}"
+      system "/usr/bin/install_name_tool", "-add_rpath", tvmlib, dylib
+      system "/usr/bin/codesign", "--force", "--sign", "-", dylib
     end
 
-    bin.install_symlink Dir[libexec/"bin/omlx"]
+    # Patch 2: ensure RECORD lists the dylib so tvm_ffi's manifest-based
+    # lookup finds it. Brew's clean pass already deleted every RECORD by
+    # the time post_install runs, so we always (re)create one.
+    record = "#{dist_dirs.first}/RECORD"
+    if File.exist?(record) && File.read(record).include?("libxgrammar_bindings.dylib")
+      ohai "  RECORD already lists the dylib"
+    else
+      ohai "  writing dylib entry to #{record}"
+      system "/bin/sh", "-c",
+             "echo 'xgrammar/libxgrammar_bindings.dylib,,' >> #{record}"
+    end
+
+    # Verify the patch took. Failing here is much less confusing than
+    # the user discovering it later via a 500 from the admin route.
+    ohai "  verifying import xgrammar..."
+    system py, "-c", "import xgrammar; print('xgrammar import OK')"
   end
 
   test do
