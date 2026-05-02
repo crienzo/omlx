@@ -1,11 +1,14 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
-  homepage "https://github.com/jundot/omlx"
+  homepage "https://github.com/crienzo/omlx"
+  # Stable URL kept pointing at upstream (jundot) so a non-HEAD install
+  # still works without cutting fork-side release tags. Build with
+  # `brew install --HEAD` to pick up this fork's changes.
   url "https://github.com/jundot/omlx/archive/refs/tags/v0.3.8.tar.gz"
   sha256 "4a18e2cf9be2313415705ef57584ed9fa38c91ab7804410008e420756cce557d"
   license "Apache-2.0"
 
-  head "https://github.com/jundot/omlx.git", branch: "main"
+  head "https://github.com/crienzo/omlx.git", branch: "crienzo"
 
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
