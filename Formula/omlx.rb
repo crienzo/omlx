@@ -54,6 +54,40 @@ class Omlx < Formula
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
     system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
 
+    # Patch the macOS arm64 xgrammar wheel so its native binding loads.
+    # The 0.1.32+ wheel ships libxgrammar_bindings.dylib with
+    # @rpath/libtvm_ffi.dylib but no LC_RPATH pointing at where tvm_ffi
+    # installs its native lib, and the dist-info is missing a RECORD
+    # entry for the dylib so tvm_ffi's manifest-based lookup fails.
+    # Both manifest as RuntimeError("Cannot find library: ...") at
+    # `import xgrammar`, which crashes /admin/api/grammar/parsers and
+    # hides the Reasoning Parser dropdown. Tracking upstream:
+    # jundot/omlx#1005.
+    if build.with?("grammar")
+      py = libexec/"bin/python"
+      site = Utils.safe_popen_read(py, "-c",
+                                   "import site; print(site.getsitepackages()[0])").chomp
+      dylib = "#{site}/xgrammar/libxgrammar_bindings.dylib"
+      dist  = Dir["#{site}/xgrammar-*.dist-info"].first
+      tvmlib = Utils.safe_popen_read(py, "-c",
+        "import os, tvm_ffi; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'lib'))").chomp
+
+      if File.exist?(dylib)
+        rpaths = Utils.safe_popen_read("/usr/bin/otool", "-l", dylib)
+        unless rpaths.include?(tvmlib)
+          system "/usr/bin/install_name_tool", "-add_rpath", tvmlib, dylib
+          system "/usr/bin/codesign", "--force", "--sign", "-", dylib
+        end
+      end
+
+      if dist
+        record = "#{dist}/RECORD"
+        unless File.exist?(record) && File.read(record).include?("libxgrammar_bindings.dylib")
+          File.open(record, "a") { |f| f.puts "xgrammar/libxgrammar_bindings.dylib,," }
+        end
+      end
+    end
+
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
 
