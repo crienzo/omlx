@@ -2,7 +2,9 @@
 """Tests for the DeepSeek V4 monkey-patch (PR 1192 port)."""
 
 import importlib
+import inspect
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -50,6 +52,12 @@ class TestPatchOrchestration:
         # __package__ must be mlx_lm.models so relative imports inside
         # the loaded file resolve through the real mlx_lm package.
         assert mod.__package__ == "mlx_lm.models"
+
+    def test_deepseek_v4_mtp_alias_registered(self, applied_patch):
+        assert (
+            sys.modules["mlx_lm.models.deepseek_v4_mtp"]
+            is sys.modules["mlx_lm.models.deepseek_v4"]
+        )
 
 
 class TestCacheInjection:
@@ -582,6 +590,61 @@ class TestModelClassResolution:
         assert model_class.__name__ == "Model"
         assert args_class.__name__ == "ModelArgs"
 
+    def test_get_classes_returns_injected_module_for_mtp_variant(self, applied_patch):
+        from mlx_lm.utils import _get_classes
+
+        model_class, args_class = _get_classes({"model_type": "deepseek_v4_mtp"})
+        assert model_class.__module__ == "mlx_lm.models.deepseek_v4"
+        assert args_class.__module__ == "mlx_lm.models.deepseek_v4"
+
+
+class TestPatchedLoadModelTrustRemoteCode:
+    """DeepSeek's patched load_model must mirror mlx-lm's custom-code gate."""
+
+    def test_signature_accepts_trust_remote_code(self, applied_patch):
+        from mlx_lm.utils import load_model
+
+        assert "trust_remote_code" in inspect.signature(load_model).parameters
+
+    def test_model_file_requires_trust_remote_code(self, tmp_path, applied_patch):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            '{"model_type": "custom", "model_file": "custom_arch.py"}'
+        )
+        (tmp_path / "custom_arch.py").write_text(
+            "\n".join(
+                [
+                    "from pathlib import Path",
+                    "import mlx.nn as nn",
+                    "Path(__file__).with_name('executed.txt').write_text('yes')",
+                    "",
+                    "class ModelArgs:",
+                    "    @classmethod",
+                    "    def from_dict(cls, config):",
+                    "        return cls()",
+                    "",
+                    "class Model(nn.Module):",
+                    "    def __init__(self, args):",
+                    "        super().__init__()",
+                ]
+            )
+        )
+
+        from mlx_lm.utils import load_model
+
+        with pytest.raises(ValueError, match="trust_remote_code=True"):
+            load_model(tmp_path, strict=False, lazy=True)
+
+        assert not (tmp_path / "executed.txt").exists()
+
+        load_model(
+            tmp_path,
+            strict=False,
+            lazy=True,
+            trust_remote_code=True,
+        )
+        assert (tmp_path / "executed.txt").read_text() == "yes"
+
 
 class TestCacheHandlerRegistration:
     """omlx CacheTypeRegistry resolves the new cache types to their handlers."""
@@ -679,6 +742,138 @@ class TestPoolingCacheStateRoundTrip:
         assert handler.get_seq_len(state) == 12
 
 
+class TestCacheMaterialization:
+    """DeepSeek-V4 cache arrays are materialized after forward updates."""
+
+    def test_helper_collects_plain_and_cachelist_leaf_arrays(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+        from mlx_lm.models.cache import CacheList
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class Leaf:
+            def __init__(self, arr):
+                self.arr = arr
+                self.none_value = None
+                self.scalar = 7
+
+        leaf_a = Leaf(mx.array([1], dtype=mx.int32))
+        leaf_b = Leaf(mx.array([2], dtype=mx.int32))
+        leaf_c = Leaf(mx.array([3], dtype=mx.int32))
+        calls = []
+
+        def fake_eval(*arrays):
+            calls.append(arrays)
+
+        monkeypatch.setattr(dsv4.mx, "eval", fake_eval)
+
+        dsv4._materialize_cache_arrays([CacheList(leaf_a, leaf_b), leaf_c, None])
+
+        assert len(calls) == 1
+        assert calls[0] == (leaf_a.arr, leaf_b.arr, leaf_c.arr)
+
+    def test_model_call_materializes_cache_after_layer_loop(self, applied_patch):
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        source = inspect.getsource(dsv4.DeepseekV4Model.__call__)
+
+        loop_pos = source.index("for layer, layer_cache in zip")
+        materialize_pos = source.index("_materialize_cache_arrays(cache)")
+        pipeline_send_pos = source.index("if pipeline_rank != 0")
+
+        assert loop_pos < materialize_pos < pipeline_send_pos
+
+
+class TestDeepseekV4SwitchGLU:
+    """DeepSeek-V4 SwitchGLU execution guards."""
+
+    def test_shared_expert_uses_configured_swiglu_limit(self, applied_patch):
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        config = dsv4.ModelArgs(
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            moe_intermediate_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=0,
+            qk_rope_head_dim=4,
+            head_dim=4,
+            o_lora_rank=0,
+            index_n_heads=2,
+            index_head_dim=4,
+            index_topk=2,
+            swiglu_limit=10.0,
+        )
+
+        moe = dsv4.DeepseekV4MoE(config, layer_idx=0)
+
+        assert moe.switch_mlp.activation.limit == config.swiglu_limit
+        assert moe.shared_experts.swiglu_limit == config.swiglu_limit
+
+    def test_skips_fused_weighted_sum_for_cache_stability(
+        self, applied_patch, monkeypatch
+    ):
+        mx = pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v4 import switch_layers
+
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "has_symbol",
+            lambda name: name == "glm_moe_weighted_sum",
+        )
+
+        def fail_weighted_sum(*args, **kwargs):
+            raise AssertionError("DeepSeek V4 must not use fused weighted sum")
+
+        monkeypatch.setattr(
+            switch_layers.glm_fast,
+            "glm_moe_weighted_sum",
+            fail_weighted_sum,
+            raising=False,
+        )
+
+        mx.random.seed(11)
+        layer = switch_layers.SwitchGLU(
+            input_dims=16,
+            hidden_dims=32,
+            num_experts=4,
+            bias=False,
+        )
+        x = mx.random.normal((1, 8, 16), dtype=mx.float32)
+        indices = mx.array(
+            [
+                [
+                    [0, 1, 2, 3, 0, 1, 2, 3],
+                    [1, 2, 3, 0, 1, 2, 3, 0],
+                    [2, 3, 0, 1, 2, 3, 0, 1],
+                    [3, 0, 1, 2, 3, 0, 1, 2],
+                    [0, 2, 1, 3, 0, 2, 1, 3],
+                    [1, 3, 2, 0, 1, 3, 2, 0],
+                    [2, 0, 3, 1, 2, 0, 3, 1],
+                    [3, 1, 0, 2, 3, 1, 0, 2],
+                ]
+            ],
+            dtype=mx.int32,
+        )
+        scores = mx.softmax(
+            mx.random.normal((1, 8, 8), dtype=mx.float32),
+            axis=-1,
+        )
+
+        y = layer(x, indices, scores=scores)
+        mx.eval(y)
+
+        assert y.shape == (1, 8, 8, 16)
+
+
 class TestPreLoadDispatch:
     """maybe_apply_pre_load_patches gates correctly on config.json model_type."""
 
@@ -710,3 +905,451 @@ class TestPreLoadDispatch:
         maybe_apply_pre_load_patches(str(tmp_path))
         # Patch must be applied after this dispatch (or already applied).
         assert is_applied() is True
+
+    def test_dispatch_for_deepseek_v4_mtp_variant(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text('{"model_type": "deepseek_v4_mtp"}')
+
+        from omlx.patches.deepseek_v4 import is_applied
+        from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+        maybe_apply_pre_load_patches(str(tmp_path))
+        assert is_applied() is True
+
+
+class TestMakeQuantizationConfigMtp:
+    """make_quantization_config must cover the MTP fusion projections.
+
+    Without explicit entries, mtp.<i>.e_proj / mtp.<i>.h_proj fall through
+    to the affine default, whose QuantizedLinear expects a .biases tensor
+    the fp8 checkpoint doesn't ship, and strict load fails."""
+
+    def test_mtp_projections_get_mxfp8(self, applied_patch):
+        import mlx.nn as nn
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class _MTPStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.e_proj = nn.Linear(8, 8, bias=False)
+                self.h_proj = nn.Linear(8, 8, bias=False)
+
+        class _ModelStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mtp = [_MTPStub()]
+                self.lm_head = nn.Linear(8, 8, bias=False)
+
+        qcfg = dsv4.make_quantization_config(_ModelStub())
+        mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+        assert qcfg["mtp.0.e_proj"] == mxfp8
+        assert qcfg["mtp.0.h_proj"] == mxfp8
+        # Non-MTP paths keep the affine default (no per-path entry).
+        assert "lm_head" not in qcfg
+
+    def test_no_mtp_no_entries(self, applied_patch):
+        import mlx.nn as nn
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class _ModelStub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lm_head = nn.Linear(8, 8, bias=False)
+
+        qcfg = dsv4.make_quantization_config(_ModelStub())
+        assert not any(k.startswith("mtp.") for k in qcfg)
+
+
+class TestDeepSeekV4SanitizeAffineSwitchMLP:
+    """Sanitize should enable the FP16 affine routed-MoE fast path."""
+
+    def test_affine_switch_mlp_scale_bias_cast_to_fp16(self, applied_patch):
+        mx = pytest.importorskip("mlx.core")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        fake_model = SimpleNamespace(
+            args=SimpleNamespace(
+                num_hidden_layers=1,
+                n_routed_experts=2,
+                o_groups=1,
+                o_lora_rank=1,
+            )
+        )
+        weights = {
+            "model.layers.0.ffn.switch_mlp.up_proj.weight": mx.zeros(
+                (2, 4, 2), dtype=mx.uint32
+            ),
+            "model.layers.0.ffn.switch_mlp.up_proj.scales": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.switch_mlp.up_proj.biases": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.switch_mlp.down_proj.weight": mx.zeros(
+                (2, 4, 2), dtype=mx.uint32
+            ),
+            "model.layers.0.ffn.switch_mlp.down_proj.scales": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.switch_mlp.down_proj.biases": mx.zeros(
+                (2, 4, 1), dtype=mx.bfloat16
+            ),
+            "model.layers.0.ffn.shared_experts.up_proj.scales": mx.zeros(
+                (4, 1), dtype=mx.bfloat16
+            ),
+        }
+
+        out = dsv4.Model.sanitize(fake_model, dict(weights))
+
+        assert out["model.layers.0.ffn.switch_mlp.up_proj.scales"].dtype == mx.float16
+        assert out["model.layers.0.ffn.switch_mlp.up_proj.biases"].dtype == mx.float16
+        assert out["model.layers.0.ffn.switch_mlp.down_proj.scales"].dtype == mx.float16
+        assert out["model.layers.0.ffn.switch_mlp.down_proj.biases"].dtype == mx.float16
+        assert (
+            out["model.layers.0.ffn.shared_experts.up_proj.scales"].dtype == mx.bfloat16
+        )
+
+
+class TestDeepSeekV4SanitizeHcAliases:
+    """Sanitize accepts both upstream HC key spellings for V4 checkpoints."""
+
+    @staticmethod
+    def _fake_model():
+        return SimpleNamespace(
+            args=SimpleNamespace(
+                num_hidden_layers=1,
+                n_routed_experts=0,
+                o_groups=1,
+                o_lora_rank=1,
+            )
+        )
+
+    def test_dotted_hc_aliases_remap_to_model_modules(self, applied_patch):
+        mx = pytest.importorskip("mlx.core")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        weights = {
+            "model.layers.0.hc_attn.base": mx.zeros((1,), dtype=mx.float32),
+            "model.layers.0.hc_attn.fn": mx.zeros((1, 1), dtype=mx.float32),
+            "model.layers.0.hc_attn.scale": mx.zeros((3,), dtype=mx.float32),
+            "model.layers.0.hc_ffn.base": mx.zeros((1,), dtype=mx.float32),
+            "model.layers.0.hc_ffn.fn": mx.zeros((1, 1), dtype=mx.float32),
+            "model.layers.0.hc_ffn.scale": mx.zeros((3,), dtype=mx.float32),
+        }
+
+        out = dsv4.Model.sanitize(self._fake_model(), dict(weights))
+
+        assert "model.layers.0.attn_hc.base" in out
+        assert "model.layers.0.attn_hc.fn" in out
+        assert "model.layers.0.attn_hc.scale" in out
+        assert "model.layers.0.ffn_hc.base" in out
+        assert "model.layers.0.ffn_hc.fn" in out
+        assert "model.layers.0.ffn_hc.scale" in out
+        assert not any(".hc_attn." in key or ".hc_ffn." in key for key in out)
+
+    def test_dotted_hc_alias_does_not_override_canonical_key(self, applied_patch):
+        mx = pytest.importorskip("mlx.core")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        weights = {
+            "model.layers.0.hc_attn.base": mx.zeros((1,), dtype=mx.float32),
+            "model.layers.0.attn_hc.base": mx.zeros((2,), dtype=mx.float32),
+        }
+
+        out = dsv4.Model.sanitize(self._fake_model(), dict(weights))
+
+        assert out["model.layers.0.attn_hc.base"].shape == (2,)
+        assert "model.layers.0.hc_attn.base" not in out
+
+
+class TestMtpSanitizeWoAReshape:
+    """The MTP patch sanitize must reshape mtp.<i>.block.attn.wo_a from the
+    2D nn.Linear layout to the 3D MultiLinear layout, like the backbone."""
+
+    @pytest.fixture()
+    def patched_sanitize(self, applied_patch):
+        import omlx.patches.mlx_lm_mtp.deepseek_v4_model as mtp_dsv4
+
+        mtp_dsv4.apply()
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        return dsv4.Model.sanitize
+
+    @staticmethod
+    def _fake_model(with_mtp=True):
+        class _Args:
+            num_hidden_layers = 1
+            num_nextn_predict_layers = 1
+            o_groups = 2
+            o_lora_rank = 4
+            n_routed_experts = 2
+
+        class _Fake:
+            args = _Args()
+
+        fake = _Fake()
+        if with_mtp:
+            fake.mtp = [object()]
+        return fake
+
+    def test_mtp_wo_a_2d_reshaped_to_3d(self, patched_sanitize):
+        import mlx.core as mx
+
+        weights = {
+            "mtp.0.attn.wo_a.weight": mx.zeros((8, 16), dtype=mx.bfloat16),
+        }
+        out = patched_sanitize(self._fake_model(), weights)
+        assert out["mtp.0.block.attn.wo_a.weight"].shape == (2, 4, 16)
+
+    def test_mtp_wo_a_3d_unchanged(self, patched_sanitize):
+        import mlx.core as mx
+
+        weights = {
+            "mtp.0.block.attn.wo_a.weight": mx.zeros((2, 4, 16), dtype=mx.bfloat16),
+        }
+        out = patched_sanitize(self._fake_model(), weights)
+        assert out["mtp.0.block.attn.wo_a.weight"].shape == (2, 4, 16)
+
+    def test_mtp_dotted_hc_alias_nested_under_block(self, patched_sanitize):
+        import mlx.core as mx
+
+        weights = {
+            "mtp.0.hc_attn.base": mx.zeros((1,), dtype=mx.float32),
+            "mtp.0.hc_ffn.scale": mx.zeros((3,), dtype=mx.float32),
+        }
+
+        out = patched_sanitize(self._fake_model(), weights)
+
+        assert "mtp.0.block.attn_hc.base" in out
+        assert "mtp.0.block.ffn_hc.scale" in out
+        assert "mtp.0.hc_attn.base" not in out
+        assert "mtp.0.hc_ffn.scale" not in out
+
+
+class TestMtpBackboneInterface:
+    """The patched DSv4 Model.__call__ must accept the full patched-backbone
+    interface — batch_generator._call_backbone passes n_confirmed=1 during
+    MTP verify cycles (crashed with TypeError before the fix)."""
+
+    def test_call_accepts_n_confirmed(self, applied_patch):
+        import omlx.patches.mlx_lm_mtp.deepseek_v4_model as mtp_dsv4
+
+        mtp_dsv4.apply()
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        sig = inspect.signature(dsv4.Model.__call__)
+        assert "n_confirmed" in sig.parameters
+        assert sig.parameters["n_confirmed"].default == 0
+        assert "return_hidden" in sig.parameters
+
+
+class TestPoolingCacheTrimRollback:
+    """trim(1) must exactly undo the last (draft) token of an MTP verify
+    update, including the pool-boundary case where the draft completed a
+    compression window. Equivalence is checked behaviorally: a trimmed
+    cache must evolve identically to a reference cache that never saw the
+    rejected token."""
+
+    @staticmethod
+    def _push(cache, tokens, offset):
+        """Feed raw per-token rows through the PoolingCache contract,
+        compressing completed windows with a deterministic stand-in
+        (mean over the window) like Compressor does."""
+        import mlx.core as mx
+
+        kv = tokens
+        gate = tokens * 0.5
+        r_kv, _r_gate, _ = cache.accumulate_windows(kv, gate, offset)
+        if r_kv.size == 0:
+            rows = mx.zeros((kv.shape[0], 0, kv.shape[-1]), dtype=kv.dtype)
+        else:
+            rows = mx.unflatten(r_kv, 1, (-1, cache.ratio)).mean(axis=2)
+        return cache.update_and_fetch(rows)
+
+    @staticmethod
+    def _tok(values):
+        import mlx.core as mx
+
+        arr = mx.array(values, dtype=mx.float32)
+        return mx.broadcast_to(arr[None, :, None], (1, len(values), 8))
+
+    def _equivalence(self, cache_cls, prefix, verify, post, applied):
+        """Drive cache through prefix + 2-token verify, trim the draft,
+        push `post`; compare against a reference that never saw the draft."""
+        import mlx.core as mx
+
+        ratio = 4
+        if cache_cls.__name__ == "BatchPoolingCache":
+            cache = cache_cls(ratio, [0])
+            ref = cache_cls(ratio, [0])
+        else:
+            cache = cache_cls(ratio)
+            ref = cache_cls(ratio)
+
+        pos = 0
+        for chunk in prefix:
+            self._push(cache, self._tok(chunk), pos)
+            self._push(ref, self._tok(chunk), pos)
+            pos += len(chunk)
+
+        # Verify forward: [confirmed, draft] on cache; confirmed only on ref.
+        self._push(cache, self._tok(verify), pos)
+        assert cache.is_trimmable()
+        assert cache.trim(1) == 1
+        self._push(ref, self._tok(verify[:1]), pos)
+        pos += 1
+
+        out = self._push(cache, self._tok(post), pos)
+        ref_out = self._push(ref, self._tok(post), pos)
+
+        if out is None or getattr(out, "size", 0) == 0:
+            assert ref_out is None or getattr(ref_out, "size", 0) == 0
+        else:
+            pl = getattr(cache, "_pool_lengths", None)
+            n = pl[0] if pl is not None else out.shape[1]
+            ref_n = ref._pool_lengths[0] if pl is not None else ref_out.shape[1]
+            assert n == ref_n
+            assert mx.allclose(out[:, :n], ref_out[:, :n]).item()
+        assert (
+            cache.remainder
+            if isinstance(cache.remainder, int)
+            else list(cache.remainder)
+        ) == (ref.remainder if isinstance(ref.remainder, int) else list(ref.remainder))
+
+    def test_easy_case_draft_in_buffer(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        # After verify: remainder = (1 + 2) % 4 = 3 >= 1 -> buffer trim.
+        self._equivalence(PoolingCache, [[1.0]], [2.0, 3.0], [4.0], applied_patch)
+
+    def test_boundary_case_draft_completed_window(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        # remainder before verify = 2; verify adds 2 -> window completes on
+        # the draft token -> undo log path (drop pooled row, replay
+        # confirmed into the buffer).
+        self._equivalence(
+            PoolingCache, [[1.0, 2.0]], [3.0, 4.0], [5.0, 6.0, 7.0], applied_patch
+        )
+
+    def test_boundary_case_with_existing_pool(self, applied_patch):
+        from mlx_lm.models.cache import PoolingCache
+
+        # One full window already pooled, then the boundary case again.
+        self._equivalence(
+            PoolingCache,
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0]],
+            [7.0, 8.0],
+            [9.0, 10.0, 11.0],
+            applied_patch,
+        )
+
+    def test_batch_easy_case(self, applied_patch):
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        self._equivalence(BatchPoolingCache, [[1.0]], [2.0, 3.0], [4.0], applied_patch)
+
+    def test_batch_boundary_case(self, applied_patch):
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        self._equivalence(
+            BatchPoolingCache,
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0]],
+            [7.0, 8.0],
+            [9.0, 10.0, 11.0],
+            applied_patch,
+        )
+
+    def test_untrimmable_when_no_undo_after_prompt(self, applied_patch):
+        """Prompt-sized updates (L > 8) don't stash an undo log; a trim at
+        a pool boundary right after one must report not-trimmable instead
+        of corrupting state. (Updates up to L == 8 keep an undo so depth-k
+        MTP verify windows can roll back.)"""
+        from mlx_lm.models.cache import PoolingCache
+
+        cache = PoolingCache(4)
+        self._push(
+            cache,
+            self._tok([float(v) for v in range(1, 13)]),  # L = 12 > 8
+            0,
+        )
+        assert cache.remainder == 0
+        assert cache.pooled is not None
+        assert not cache.is_trimmable()
+        assert cache.trim(1) == 0
+
+    def test_verify_sized_update_keeps_undo(self, applied_patch):
+        """MTP verify windows (2 < L <= 8) stash an undo log: a trim right
+        after one rolls back across the pool boundary instead of failing."""
+        from mlx_lm.models.cache import PoolingCache
+
+        cache = PoolingCache(4)
+        self._push(cache, self._tok([1.0, 2.0, 3.0, 4.0]), 0)
+        assert cache.remainder == 0
+        assert cache.pooled is not None
+        assert cache.is_trimmable()
+        assert cache.trim(1) == 1
+        # The completed window is undone: its 3 surviving tokens are back
+        # in the remainder buffer and no pooled row remains visible.
+        assert cache.remainder == 3
+        assert cache.size() == 0
+
+
+class TestNaxMoEStockRouting:
+    """NAX GPUs route prefill-sized MoE gemms to stock mx.gather_qmm."""
+
+    @pytest.fixture(autouse=True)
+    def _nax_off_by_default(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        # Pin detection off so the block-kernel tests behave identically on
+        # M5-family machines; each test overrides what it needs.
+        monkeypatch.setattr(sl, "is_nax_available", lambda: False)
+        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "")
+        yield
+
+    def test_prefers_stock_for_prefill_route_counts_only(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
+        assert not sl._nax_prefers_stock(8)
+        assert not sl._nax_prefers_stock(sl._NAX_STOCK_MIN_ROUTES - 1)
+        assert sl._nax_prefers_stock(sl._NAX_STOCK_MIN_ROUTES)
+        assert sl._nax_prefers_stock(1 << 20)
+
+    def test_no_stock_routing_without_nax(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        assert not sl._nax_prefers_stock(1 << 20)
+
+    def test_env_kill_switch_keeps_block_kernels(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
+        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "0")
+        assert not sl._nax_prefers_stock(1 << 20)
+
+    def test_env_force_routes_everything(self, monkeypatch):
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
+        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "1")
+        assert sl._nax_prefers_stock(1)
+
+    def test_native_block_kind_short_circuits_on_nax_prefill(self, monkeypatch):
+        import mlx.core as mx
+
+        from omlx.patches.deepseek_v4 import switch_layers as sl
+
+        linear = sl.QuantizedSwitchLinear(
+            64, 64, num_experts=2, bias=False, group_size=64, bits=4
+        )
+        monkeypatch.setattr(sl, "_nax_prefers_stock", lambda n: n >= 1024)
+        prefill_x = mx.zeros((2048, 1, 64), dtype=mx.bfloat16)
+        assert linear._native_block_kind(prefill_x, True) is None
+        # Decode-sized calls fall through to the regular block-kernel gates:
+        # the NAX gate must not change what they resolve to.
+        decode_x = mx.zeros((8, 1, 64), dtype=mx.bfloat16)
+        gated = linear._native_block_kind(decode_x, True)
+        monkeypatch.setattr(sl, "_nax_prefers_stock", lambda n: False)
+        assert gated == linear._native_block_kind(decode_x, True)

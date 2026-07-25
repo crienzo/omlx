@@ -330,6 +330,8 @@ class TestActiveBenchEndpoint:
             "running": True,
             "bench_id": "bench-abc",
             "model_id": "model-x",
+            "force_lm_engine": False,
+            "external": False,
         }
 
 

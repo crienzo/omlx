@@ -45,7 +45,7 @@ final class OMLXClient: ObservableObject {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(host: String = "127.0.0.1", port: Int = 8080, apiKey: String? = nil) {
+    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil) {
         self.host = host
         self.port = port
         self.apiKey = apiKey
@@ -243,6 +243,18 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    /// Fetch the README for a Hugging Face repo, the same payload the
+    /// browser admin renders in its model-card slide-over. Cache-aware
+    /// on the server (uses `hf_hub_download` under the hood), so post-
+    /// download lookups skip the network. Returns an empty
+    /// `modelCard` string when the upstream repo has no README — that
+    /// is a "no card" state, not an error.
+    func getHFModelCard(repoId: String) async throws -> ModelCardDTO {
+        try await get(AdminAPI.hfModelInfo, query: [
+            URLQueryItem(name: "repo_id", value: repoId),
+        ])
+    }
+
     // MARK: - ModelScope (Phase 2)
     //
     // 1:1 mirror of the /hf/* surface above, pointed at the parallel
@@ -303,6 +315,15 @@ final class OMLXClient: ObservableObject {
         ])
     }
 
+    /// ModelScope mirror of `getHFModelCard(repoId:)`. Returns the same
+    /// shape (`{model_card: "<markdown>"}`); empty string when the
+    /// upstream repo has no README.
+    func getMSModelCard(modelId: String) async throws -> ModelCardDTO {
+        try await get(AdminAPI.msModelInfo, query: [
+            URLQueryItem(name: "model_id", value: modelId),
+        ])
+    }
+
     /// Delete a downloaded model directory from disk. The server unloads
     /// the engine first if it's currently loaded, then rmtree's the model
     /// directory and refreshes the pool. 404 if the name doesn't resolve.
@@ -345,7 +366,7 @@ final class OMLXClient: ObservableObject {
         oqLevel: Double,
         preserveMtp: Bool = false
     ) async throws -> OQEstimateResponse {
-        // `oq_level` accepts ints (2,3,4,5,6,8) and 3.5. Send it without a
+        // `oq_level` accepts ints and fractional levels. Send it without a
         // trailing `.0` so the server parses an int when the user picked one.
         let levelStr: String = (oqLevel.rounded() == oqLevel)
             ? String(Int(oqLevel))

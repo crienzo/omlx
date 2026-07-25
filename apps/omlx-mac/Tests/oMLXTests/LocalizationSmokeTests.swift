@@ -17,6 +17,13 @@ import XCTest
 @testable import oMLX
 
 final class LocalizationSmokeTests: XCTestCase {
+    private static let englishBundle: Bundle = {
+        guard let path = Bundle.main.path(forResource: "en", ofType: "lproj"),
+              let bundle = Bundle(path: path) else {
+            return .main
+        }
+        return bundle
+    }()
 
     /// Hard-coded baseline of common.* keys → English values. Only the
     /// primitives actually used by at least one wrapped call site live here;
@@ -58,13 +65,14 @@ final class LocalizationSmokeTests: XCTestCase {
         "settings.section.basic", "settings.advanced.experimental.section",
         // Menubar + updates
         "menubar.item.quit", "menubar.stats.session_section",
-        "update.channel.stable",
+        "menubar.item.settings", "menubar.item.web_dashboard",
+        "update.channel.stable", "update.confirm.title",
     ]
 
     func testCatalogResolvesCommonBaseline() {
         // Force English so the assertion holds regardless of host locale.
         for (key, expected) in Self.commonBaseline {
-            let resolved = NSLocalizedString(key, bundle: .main,
+            let resolved = NSLocalizedString(key, bundle: Self.englishBundle,
                                              value: key, comment: "")
             XCTAssertEqual(resolved, expected,
                            "common key \(key) resolved to \(resolved); expected \(expected)")

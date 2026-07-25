@@ -10,8 +10,8 @@ It adds:
 
 * a Multi-Token Prediction head (``MTPModule``) to
   ``mlx_vlm.models.qwen3_5.language.LanguageModel`` when the config
-  declares ``mtp_num_hidden_layers > 0`` and the process-wide MTP active
-  flag is on;
+  declares ``mtp_num_hidden_layers > 0`` and the checkpoint has MTP
+  weights to bind;
 * a ``return_hidden=True`` mode on ``LanguageModel.__call__`` that
   returns ``(logits, pre_norm_hidden, gdn_states)``.
 
@@ -26,11 +26,9 @@ on draft rejection uses mlx-vlm's stock
 and consumes the ``gdn_states`` returned from this patched ``__call__``.
 
 Apply ordering: this patch must run *before* ``mlx_vlm.utils.load(...)``
-so the patched ``LanguageModel.__init__`` runs, and *before*
-``omlx/patches/gated_delta_advance.py`` overrides
-``Qwen3_5GatedDeltaNet.__call__``. ``maybe_apply_pre_load_patches`` in
+so the patched ``LanguageModel.__init__`` runs. ``maybe_apply_pre_load_patches`` in
 ``omlx/utils/model_loading.py`` calls ``apply_mlx_vlm_mtp_runtime_patch``
-ahead of both, satisfying the ordering for inference. The oQ path in
+before loading the model, satisfying the ordering for inference. The oQ path in
 ``omlx/oq.py:_measure_sensitivity`` also calls it before
 ``vlm_load_model`` for sensitivity measurement.
 """
@@ -67,10 +65,43 @@ def apply() -> bool:
     # VLMModelAdapter pass-throughs are installed by the MoE runtime patch
     # too; the function is idempotent so calling it twice is safe.
     _patch_vlm_model_adapter()
+    _patch_vlm_outer_model_load_weights()
 
     _APPLIED = True
     logger.info("mlx-vlm Qwen3.5 (dense) runtime MTP patch applied")
     return True
+
+
+def _patch_vlm_outer_model_load_weights() -> None:
+    """Repair miscalibrated MTP-head norms in ``Model.load_weights`` payloads.
+
+    Older oQ conversions stored the head's q_norm/k_norm/mtp.norm one below
+    the correct MLX value; ``repair_legacy_head_norms`` re-applies the +1 at
+    load time. Idempotent-safe on correctly-converted models.
+    """
+    try:
+        from mlx_vlm.models import qwen3_5 as q35_outer
+    except Exception as e:
+        logger.debug(f"mlx_vlm outer qwen3_5 not importable: {e}")
+        return
+
+    cls = q35_outer.Model
+    if getattr(cls, "_omlx_mtp_norm_repair_patched", False):
+        return
+
+    original_load_weights = cls.load_weights
+
+    def load_weights(self, weights, strict=True):
+        from ..mlx_lm_mtp.norm_repair import repair_legacy_head_norms
+
+        try:
+            weights, _ = repair_legacy_head_norms(weights)
+        except Exception:
+            logger.warning("MTP head-norm repair failed", exc_info=True)
+        return original_load_weights(self, weights, strict=strict)
+
+    cls.load_weights = load_weights
+    cls._omlx_mtp_norm_repair_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +223,7 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         from . import is_mtp_attach_enabled
+        from ..mlx_lm_mtp import is_mtp_active
 
         original_init(self, args, config)
         # Attach MTPModule when the config declares MTP heads so mlx-vlm's
@@ -199,33 +231,48 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         # checkpoints) can place the persisted mtp.* tensors. Whether MTP
         # speculative decode is actually invoked at inference time is gated
         # downstream by ``mlx_lm_mtp.batch_generator._is_mtp_eligible``,
-        # which checks the process-wide ``is_mtp_active`` flag.
+        # which checks the per-instance ``_omlx_mtp_decode_enabled`` marker.
         #
         # Gated by ``is_mtp_attach_enabled()`` so checkpoints that declare
         # mtp_num_hidden_layers > 0 but ship no mtp.* weights (unsloth
         # Qwen3.6 UD MLX builds, issue #1426) don't fail strict load_weights
         # with "Missing N parameters" and silently downgrade to LLM.
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
-        if n_mtp > 0 and is_mtp_attach_enabled():
+        attach_enabled = bool(is_mtp_attach_enabled())
+        self._omlx_mtp_decode_enabled = bool(
+            n_mtp > 0 and attach_enabled and is_mtp_active()
+        )
+        if n_mtp > 0 and attach_enabled:
             self.mtp = q35_lang.MTPModule(args)
+        if self._omlx_mtp_decode_enabled:
+            # Depth-k chained drafting works on this path: mtp_forward
+            # supports return_hidden below, and rollback uses mlx-vlm's
+            # stock rollback_speculative_cache (native partial accepts).
+            from ..mlx_lm_mtp import get_mtp_depth
+
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = get_mtp_depth()
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with optional MTP-cycle return shape.
 
-        With ``return_hidden=True``, returns the triple
-        ``(logits, pre_norm_hidden, gdn_states)`` for the speculative
-        decode cycle. ``n_confirmed`` is accepted and discarded — the
-        mlx-vlm path uses post-hoc ``rollback_speculative_cache`` instead
-        of a confirmed/draft split.
+        With ``return_hidden=True``, returns ``LanguageModelOutput`` with
+        pre-norm hidden states for the speculative decode cycle. ``n_confirmed``
+        is accepted and discarded — the mlx-vlm path uses post-hoc
+        ``rollback_speculative_cache`` instead of a confirmed/draft split.
         """
         return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
         kwargs.pop("n_confirmed", None)
         if not return_hidden:
             return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
 
         # Passing any non-None ``capture_layer_ids`` makes stock
         # ``LanguageModel.__call__`` allocate ``hidden_sink`` AND ``gdn_sink``,
-        # both of which the MTP cycle needs.
+        # both of which the MTP cycle needs. Pop any existing value from kwargs
+        # to avoid "got multiple values for keyword argument" when the caller
+        # already passed capture_layer_ids.
+        kwargs.pop("capture_layer_ids", None)
         last_layer_idx = len(self.model.layers) - 1
         out = original_call(
             self,
@@ -236,19 +283,43 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             capture_layer_ids=[last_layer_idx],
             **kwargs,
         )
-        hidden_pre_norm = out.hidden_states[0]
-        return out.logits, hidden_pre_norm, out.gdn_states
+        from mlx_vlm.models.base import LanguageModelOutput
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+        hidden_pre_norm = out.hidden_states[0]
+        return LanguageModelOutput(
+            logits=out.logits,
+            hidden_states=[hidden_pre_norm],
+            gdn_states=out.gdn_states,
+            shared_kv_states={} if return_shared_kv else None,
+        )
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        """MTP-head forward (see mlx_lm_mtp.qwen35_model for the depth-k
+        chain contract: return_hidden yields the head's post-norm hidden for
+        chaining; logits_keep limits the lm_head to the last N positions)."""
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
             self.model.embed_tokens,
             mtp_cache,
         )
+        logits_source = mtp_out
+        if logits_keep and logits_source.shape[1] > logits_keep:
+            logits_source = logits_source[:, -logits_keep:, :]
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(mtp_out)
-        return self.lm_head(mtp_out)
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, mtp_out
+        return logits
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
@@ -285,7 +356,24 @@ def _patch_vlm_model_adapter() -> None:
     def mtp(self):
         return getattr(self._language_model, "mtp", None)
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        # Forward the depth-k chain kwargs only when set so language models
+        # whose mtp_forward predates them (MoE runtime) keep working.
+        if return_hidden or logits_keep:
+            return self._language_model.mtp_forward(
+                hidden_states,
+                next_token_ids,
+                mtp_cache,
+                return_hidden=return_hidden,
+                logits_keep=logits_keep,
+            )
         return self._language_model.mtp_forward(
             hidden_states, next_token_ids, mtp_cache
         )

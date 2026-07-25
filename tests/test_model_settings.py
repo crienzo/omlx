@@ -25,6 +25,7 @@ class TestModelSettings:
         assert settings.force_sampling is False
         assert settings.is_pinned is False
         assert settings.is_default is False
+        assert settings.is_favorite is False
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
 
@@ -35,6 +36,33 @@ class TestModelSettings:
         assert d["trust_remote_code"] is True
         restored = ModelSettings.from_dict(d)
         assert restored.trust_remote_code is True
+
+    def test_is_favorite_roundtrip(self):
+        """Test is_favorite field survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(is_favorite=True)
+        d = original.to_dict()
+        assert d["is_favorite"] is True
+        restored = ModelSettings.from_dict(d)
+        assert restored.is_favorite is True
+
+    def test_guided_grammar_defaults(self):
+        """Test guided grammar defaults to disabled."""
+        settings = ModelSettings()
+        assert settings.guided_grammar_enabled is False
+        assert settings.guided_grammar is None
+
+    def test_guided_grammar_roundtrip(self):
+        """Test guided grammar survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(
+            guided_grammar_enabled=True,
+            guided_grammar='root ::= "YES"',
+        )
+        d = original.to_dict()
+        assert d["guided_grammar_enabled"] is True
+        assert d["guided_grammar"] == 'root ::= "YES"'
+        restored = ModelSettings.from_dict(d)
+        assert restored.guided_grammar_enabled is True
+        assert restored.guided_grammar == 'root ::= "YES"'
 
     def test_trust_remote_code_excluded_from_profiles(self):
         """Security flag must never propagate via profiles or templates."""
@@ -196,6 +224,75 @@ class TestModelSettings:
         settings = ModelSettings()
         d = settings.to_dict()
         assert "model_type_override" not in d
+
+    def test_turboquant_kv_bits_default(self):
+        """Default bit depth = 4."""
+        settings = ModelSettings()
+        assert settings.turboquant_kv_bits == 4
+
+    def test_turboquant_kv_bits_roundtrip(self):
+        original = ModelSettings(turboquant_kv_bits=2.5)
+        d = original.to_dict()
+        assert d["turboquant_kv_bits"] == 2.5
+        restored = ModelSettings.from_dict(d)
+        assert restored.turboquant_kv_bits == 2.5
+
+    def test_turboquant_kv_bits_always_in_to_dict(self):
+        """Non-Optional field with a default must always serialize."""
+        settings = ModelSettings()
+        assert "turboquant_kv_bits" in settings.to_dict()
+
+    def test_turboquant_skip_last_default(self):
+        """Default = True — protects sensitive models from last-layer corruption."""
+        settings = ModelSettings()
+        assert settings.turboquant_skip_last is True
+
+    def test_turboquant_skip_last_roundtrip(self):
+        original = ModelSettings(turboquant_skip_last=False)
+        d = original.to_dict()
+        assert d["turboquant_skip_last"] is False
+        restored = ModelSettings.from_dict(d)
+        assert restored.turboquant_skip_last is False
+
+    def test_native_mtp_allows_turboquant(self):
+        settings = ModelSettings(mtp_enabled=True, turboquant_kv_enabled=True)
+        assert settings.mtp_enabled is True
+        assert settings.turboquant_kv_enabled is True
+
+    def test_vlm_mtp_rejects_turboquant(self):
+        with pytest.raises(ValueError, match="vlm_mtp_enabled.*turboquant"):
+            ModelSettings(vlm_mtp_enabled=True, turboquant_kv_enabled=True)
+
+    def test_vlm_mtp_draft_model_default(self):
+        settings = ModelSettings()
+        assert settings.vlm_mtp_draft_model is None
+
+    def test_vlm_mtp_draft_model_roundtrip(self):
+        original = ModelSettings(vlm_mtp_draft_model="gemma-4-26B-A4B-it-assistant")
+        d = original.to_dict()
+        assert d["vlm_mtp_draft_model"] == "gemma-4-26B-A4B-it-assistant"
+        restored = ModelSettings.from_dict(d)
+        assert restored.vlm_mtp_draft_model == "gemma-4-26B-A4B-it-assistant"
+
+    def test_vlm_mtp_draft_model_excluded_when_none(self):
+        settings = ModelSettings()
+        assert "vlm_mtp_draft_model" not in settings.to_dict()
+
+    def test_vlm_mtp_draft_block_size_default(self):
+        """None means 'use mlx-vlm default'."""
+        settings = ModelSettings()
+        assert settings.vlm_mtp_draft_block_size is None
+
+    def test_vlm_mtp_draft_block_size_roundtrip(self):
+        original = ModelSettings(vlm_mtp_draft_block_size=8)
+        d = original.to_dict()
+        assert d["vlm_mtp_draft_block_size"] == 8
+        restored = ModelSettings.from_dict(d)
+        assert restored.vlm_mtp_draft_block_size == 8
+
+    def test_vlm_mtp_draft_block_size_excluded_when_none(self):
+        settings = ModelSettings()
+        assert "vlm_mtp_draft_block_size" not in settings.to_dict()
 
 
 class TestModelSettingsManager:
@@ -489,6 +586,56 @@ class TestModelSettingsManager:
         d = original.to_dict()
         restored = ModelSettings.from_dict(d)
         assert restored.forced_ct_kwargs == ["enable_thinking", "reasoning_effort"]
+
+    def test_merge_chat_template_request_kwargs_request_overrides_model(self):
+        """Request kwargs override model chat-template defaults."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "custom_flag": "model",
+            }
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings,
+            {"enable_thinking": False},
+        )
+
+        assert merged == {"enable_thinking": False, "custom_flag": "model"}
+
+    def test_merge_chat_template_request_kwargs_dedicated_overrides_raw(self):
+        """Dedicated model fields override model raw chat-template kwargs."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={"enable_thinking": False},
+            enable_thinking=True,
+        )
+
+        assert merge_chat_template_request_kwargs(settings) == {
+            "enable_thinking": True
+        }
+
+    def test_merge_chat_template_request_kwargs_respects_forced_keys(self):
+        """Forced keys block request-level chat-template overrides."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(
+            chat_template_kwargs={
+                "enable_thinking": True,
+                "custom_flag": "model",
+            },
+            forced_ct_kwargs=["enable_thinking"],
+        )
+
+        merged = merge_chat_template_request_kwargs(
+            settings,
+            {"enable_thinking": False, "custom_flag": "request"},
+        )
+
+        assert merged == {"enable_thinking": True, "custom_flag": "request"}
 
     def test_thread_safety(self):
         """Test thread-safe access."""
